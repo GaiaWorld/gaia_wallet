@@ -7,5 +7,9 @@ export class Api {
 
     balanceOf(address: string): number {
         return 0;
-    }    
+    }
+    
+    feePerKB(): number {
+        return 0;
+    }
 }
