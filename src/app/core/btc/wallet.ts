@@ -6,6 +6,10 @@ import { Cipher } from '../crypto/cipher';
 const HDWallet = bitcore.HDPrivateKey;
 const UnspentOutput = bitcore.Transaction.UnspentOutput;
 const Transaction = bitcore.Transaction;
+const PrivateKey = bitcore.PrivateKey;
+
+type LANGUAGE = "english" | "chinese_simplified" | "chinese_traditional";
+type NETWORK = "mainnet" | "testnet";
 
 export class UTXO {
     txid: string; // transaction hash that generate this utxo
@@ -33,6 +37,9 @@ export class BTCWallet {
 
     // dedicated for HD wallet, should be encrypted
     private _rootXpriv: string;
+    private _mnemonics: string;
+
+    isLocked: boolean;
 
     // m/bip_number/coin_type/account/internal_or_external/index
     static BIP44_BTC_TESTNET_BASE_PATH = "m/44'/1'/0'/0/";
@@ -56,14 +63,50 @@ export class BTCWallet {
     setBlance(balance: number): void {
         this.balance = balance;
     }
+    
+    lock(passwd: string): void {
 
-    isHDWallet(): boolean {
-        if(this._rootXpriv.length !== 0) {
-            return true;
-        }
-
-        return false;
     }
+
+    unlock(passwd: string): void {
+
+    }
+
+    /**
+     * Generate an HD wallet from scratch
+     * 
+     * @static
+     * @param {string} passwd Password used to encrypt secrets
+     * @param {number} strength Default to 128, must be a divided by 32
+     * @param {NETWORK} network Network idenitifer
+     * @param {LANGUAGE} lang Mnenomic language
+     * @param {string} [passphrase] Salt used to provide extra credentials to generate seed, default to null
+     * @returns {BTCWallet} 
+     * @memberof BTCWallet
+     */
+    static generate(passwd: string, strength: number, network: NETWORK, lang: LANGUAGE, passphrase?: string): BTCWallet {
+        let mn = new Mnemonic(lang);
+        passphrase = passphrase || "";
+        strength = strength || 128;
+
+        // TODO: check passwd
+
+        let mnemonics = mn.generate(strength);
+        if(!mn.check(mnemonics)) {
+            throw new Error("Invalid Mnemonic words!");
+        }
+        let seed = mn.toSeed(mnemonics, passphrase);
+        let hdpriv = HDWallet.fromSeed(seed, network);
+
+        let btcwallet = new BTCWallet();
+        btcwallet._rootXpriv = hdpriv.toString();
+        btcwallet.rootXpub = hdpriv.xpubkey;
+        // TODO: encrypt
+        btcwallet._mnemonics = mnemonics;
+
+        return btcwallet;
+    }
+
     /**
      * Build HD wallet from mnemonic words
      * 
@@ -75,9 +118,9 @@ export class BTCWallet {
      * @returns {BTCWallet} 
      * @memberof BTCWallet
      */
-    static fromMnemonic(mnemonic: string, network: "mainnet" | "testnet", lang: "english" | "chinese_simplified" | "chinese_traditional",passphrase?: string): BTCWallet {
+    static fromMnemonic(mnemonic: string, network: NETWORK, lang: LANGUAGE, passphrase?: string): BTCWallet {
         let mn = new Mnemonic(lang);
-        passphrase = passphrase || "";        
+        passphrase = passphrase || "";
 
         if(!mn.check(mnemonic)) {
             throw new Error("Invalid Mnemonic words!");
@@ -93,16 +136,27 @@ export class BTCWallet {
         return btcwallt;
     }
 
-    static fromWIF(wif: string): BTCWallet {
-        // TODO
-        return new BTCWallet();
+    exportMnemonics(): string {
+        // TODO: Decrypt
+        return this._mnemonics;
+    }
+
+    /**
+     * Export WIF format private key for specified index
+     * 
+     * @param {number} index 
+     * @returns {string} 
+     * @memberof BTCWallet
+     */
+    exportWIFOf(index: number): string {
+        return this._privateKeyOf(index).toWIF();
     }
 
     derive(index: number): string {
-        return this.privateKeyOf(index).toAddress().toString();
+        return this._privateKeyOf(index).toAddress().toString();
     }
 
-    private privateKeyOf(index: number): any {
+    private _privateKeyOf(index: number): any {
         let path: string;
         let parent = new HDWallet(this._rootXpriv);
 
@@ -110,6 +164,8 @@ export class BTCWallet {
             path = BTCWallet.BIP44_BTC_TESTNET_BASE_PATH + index;
         } else if(parent.network.name === "livenet") {
             path = BTCWallet.BIP44_BTC_MAINNET_BASE_PATH + index;
+        } else {
+            throw new Error("Unexpected network name!");
         }
 
         return parent.derive(path).privateKey;
@@ -117,26 +173,16 @@ export class BTCWallet {
 
     signRawTransaction(input: UTXO | UTXO[], output: Output, index: number): string {
         let utxo = UnspentOutput.fromObject(input);
-        let tx = Transaction()
+        let tx = Transaction().fee(800000)
             .from(utxo)
             .to(output.toAddr, output.amount)
             .change(output.chgAddr)
-            .sign(this.privateKeyOf(index));
+            .sign(this._privateKeyOf(index));
 
         return tx.toString("hex");
     }
 
-    composeUTXOs
-
-    scanAddress() {
-
-    }
-
-    calcFees() {
-
-    }
-
-    getUTXOForUsedAddress() {
+    composeUTXOs(targetSatoshi: number) {
 
     }
 }
