@@ -1,12 +1,17 @@
 import { bitcore } from "../thirdparty/bitcore-lib";
 import { Mnemonic } from '../thirdparty/bip39';
-import { WORDLISTS } from '../thirdparty/wordlist';
 import { Cipher } from '../crypto/cipher';
+import { Api } from './api';
 
 const HDWallet = bitcore.HDPrivateKey;
 const UnspentOutput = bitcore.Transaction.UnspentOutput;
 const Transaction = bitcore.Transaction;
 const PrivateKey = bitcore.PrivateKey;
+const Script = bitcore.Script;
+const Unit = bitcore.Unit;
+
+const cipher = new Cipher();
+
 
 type LANGUAGE = "english" | "chinese_simplified" | "chinese_traditional";
 type NETWORK = "mainnet" | "testnet";
@@ -17,20 +22,20 @@ export class UTXO {
     address: string; // who own this utxo
     scriptPubKey: string; // public key hash
     amount: number // BTC unit
+    confirmations?: number;
 }
 
 export class Output {
     toAddr: string;
     amount: number;
-    chgAddr: string;
+    chgAddr?: string;
 }
 
 export class BTCWallet {
     // funds that have at least `MIN_CONFIRMATION`
     public balance: number;
 
-    // how many receving addresses have been used since last time
-    public totalUsedReceivingAddress: number;
+    public usedAdresses: Array<string>;
 
     // used to retreive all the utxos of this wallet
     public rootXpub: string;
@@ -39,7 +44,9 @@ export class BTCWallet {
     private _rootXpriv: string;
     private _mnemonics: string;
 
-    isLocked: boolean;
+    private _api: Api;
+
+    private _isLocked = false;
 
     // m/bip_number/coin_type/account/internal_or_external/index
     static BIP44_BTC_TESTNET_BASE_PATH = "m/44'/1'/0'/0/";
@@ -47,14 +54,15 @@ export class BTCWallet {
 
 
     // most look ahead addresses
-    static GAP_LIMIT = 10;
+    static GAP_LIMIT = 3;
 
     // minimum confirmations
-    static MIN_CONFIRMATION = 6;
+    static MIN_CONFIRMATIONS = 6;
 
     constructor() {
-        this.balance = 0;
-        this.totalUsedReceivingAddress = 0;
+        this.balance = 0.264;
+        this._api = new Api();
+        this.usedAdresses = new Array();
     }
 
     getBlance(): number {
@@ -65,11 +73,19 @@ export class BTCWallet {
     }
     
     lock(passwd: string): void {
-
+        if(this._isLocked === false) {
+            this._rootXpriv = cipher.encrypt(passwd, this._rootXpriv);
+            this._mnemonics = cipher.encrypt(passwd, this._mnemonics);
+            this._isLocked = true;
+        }
     }
 
     unlock(passwd: string): void {
-
+        if(this._isLocked === true) {
+            this._rootXpriv = cipher.decrypt(passwd, this._rootXpriv);
+            this._mnemonics = cipher.decrypt(passwd, this._mnemonics);
+            this._isLocked = false;
+        }
     }
 
     /**
@@ -118,7 +134,7 @@ export class BTCWallet {
      * @returns {BTCWallet} 
      * @memberof BTCWallet
      */
-    static fromMnemonic(mnemonic: string, network: NETWORK, lang: LANGUAGE, passphrase?: string): BTCWallet {
+    static fromMnemonic(passwd: string, mnemonic: string, network: NETWORK, lang: LANGUAGE, passphrase?: string): BTCWallet {
         let mn = new Mnemonic(lang);
         passphrase = passphrase || "";
 
@@ -131,13 +147,18 @@ export class BTCWallet {
         let btcwallt = new BTCWallet();
         
         btcwallt._rootXpriv = hdpriv.toString();
+        btcwallt._mnemonics = mnemonic;
         btcwallt.rootXpub = hdpriv.xpubkey;
+
+        btcwallt.lock(passwd);
 
         return btcwallt;
     }
 
     exportMnemonics(): string {
-        // TODO: Decrypt
+        if(this._isLocked === true) {
+            throw new Error("You need to unlock wallet first!");
+        }
         return this._mnemonics;
     }
 
@@ -157,6 +178,10 @@ export class BTCWallet {
     }
 
     private _privateKeyOf(index: number): any {
+        if(this._isLocked === true) {
+            throw new Error("You need to unlock wallet first!");
+        }
+
         let path: string;
         let parent = new HDWallet(this._rootXpriv);
 
@@ -171,7 +196,16 @@ export class BTCWallet {
         return parent.derive(path).privateKey;
     }
 
-    signRawTransaction(input: UTXO | UTXO[], output: Output, index: number): string {
+    address2Index(address: string): number {
+        for(let i = 0; i < this.usedAdresses.length; i++) {
+            if(this.usedAdresses[i] === address) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    signRawTransaction(input: UTXO, output: Output, index: number): string {
         let utxo = UnspentOutput.fromObject(input);
         let tx = Transaction().fee(800000)
             .from(utxo)
@@ -182,7 +216,108 @@ export class BTCWallet {
         return tx.toString("hex");
     }
 
-    composeUTXOs(targetSatoshi: number) {
+    async spend(output: Output): Promise<string> {
+        if(output.amount >= this.balance) {
+            throw new Error("Insufficient balance!");
+        }
 
+        let utxos = await this.getUnspentOutputs(6);
+        utxos.sort((a, b) => a.amount - b.amount);
+
+        let collected = [];
+        let accumlated = 0;
+        for(let i = 0; i < utxos.length; i++) {
+            accumlated += utxos[i].amount;
+            collected.push(utxos[i]);
+            if(accumlated > output.amount) {
+                break;
+            }
+        }
+
+        let keySet = [];
+        for(let i = 0; i < collected.length; i++) {
+            keySet.push(this._privateKeyOf(this.address2Index(collected[i].address)));
+        }
+
+        console.log("collected: ", collected)
+        console.log("accumlated: ", accumlated)
+        console.log("keyset: ", keySet)
+
+        output.amount = Unit.fromBTC(output.amount).toSatoshis();
+        let rawTx = new Transaction()
+            .from(collected)
+            .to(output.toAddr, output.amount)
+            // .change(output.chgAddr === undefined ? this.derive(0) : output.chgAddr)
+            .change(output.chgAddr)
+            .sign(keySet)
+
+        let serialized = rawTx.serialize(true);
+        // If it is successed ?
+        let res = await this._api.sendRawTransaction(serialized);
+
+        // little endian
+        return rawTx._getHash().toString('hex');
+    }
+
+    private _p2pkh(address: string): any {
+        return Script.buildPublicKeyHashOut(address);
+    }
+
+    async getSafeBalance(): Promise<number> {
+        let sum = 0;
+        let utxos = await this.getUnspentOutputs(BTCWallet.MIN_CONFIRMATIONS);
+        for(let i = 0; i < utxos.length; i++) {
+            sum += utxos[i].amount;
+        }
+
+        return sum;
+    }
+
+    async getUnspentOutputs(confirmations = 1): Promise<UTXO[]> {
+        let utxos = [];
+        let used = await this.scanUsedAddress();
+        for(let i = 0; i < used; i++) {
+            let address = this.derive(i);
+            // TODO: requrest error handling
+            let addrinfo = await this._api.getAddrInfo(address, true);
+            if(addrinfo.final_balance !==0 && addrinfo.txrefs.length !== 0) {
+                let utxo = addrinfo.txrefs;
+                for(let j = 0; j < utxo.length; j++) {
+                    if(utxo[j].confirmations >= confirmations) {
+                        utxos.push({
+                            "txid": utxo[j].tx_hash,
+                            "vout": utxo[j].tx_output_n,
+                            "address": address,
+                            "scriptPubKey": this._p2pkh(address).toHex(),
+                            "amount": Unit.fromSatoshis(utxo[j].value).BTC,
+                            "confirmations": utxo[j].confirmations
+                        })
+                    }                    
+                }
+            }     
+        }
+
+        return utxos;     
+    }
+
+    async scanUsedAddress(): Promise<number> {
+        let count = 0;
+        let i     = 0;
+        for(i = 0; ; i++) {
+            // TODO: request error handling
+            let res = await this._api.getAddrInfo(this.derive(i));
+            if(res.total_received === 0 && res.total_sent === 0) {
+                count = count + 1;
+            } else {
+                this.usedAdresses.push(res.address);
+                count = 0;
+            }
+
+            if(count > BTCWallet.GAP_LIMIT) {
+                break;
+            }
+        }
+
+        return i - BTCWallet.GAP_LIMIT;
     }
 }
