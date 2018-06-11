@@ -15,6 +15,7 @@ const cipher = new Cipher();
 
 type LANGUAGE = "english" | "chinese_simplified" | "chinese_traditional";
 type NETWORK = "mainnet" | "testnet";
+type PRIORITY = "high" | "medium" | "low";
 
 export class UTXO {
     txid: string; // transaction hash that generate this utxo
@@ -35,7 +36,7 @@ export class BTCWallet {
     // funds that have at least `MIN_CONFIRMATION`
     public balance: number;
 
-    public usedAdresses: Array<string>;
+    public usedAdresses = {};
 
     // used to retreive all the utxos of this wallet
     public rootXpub: string;
@@ -48,7 +49,7 @@ export class BTCWallet {
 
     private _isLocked = false;
 
-    // m/bip_number/coin_type/account/internal_or_external/index
+    // m/bip_number/coin_type/account/internal_or_external/index, we don't use change address
     static BIP44_BTC_TESTNET_BASE_PATH = "m/44'/1'/0'/0/";
     static BIP44_BTC_MAINNET_BASE_PATH = "m/44'/0'/0'/0/";
 
@@ -59,10 +60,12 @@ export class BTCWallet {
     // minimum confirmations
     static MIN_CONFIRMATIONS = 6;
 
+    static SAFELOW_FEE = 2;
+    static HIGHEST_FEE = 10;
+
     constructor() {
-        this.balance = 0.264;
+        this.balance = 0.26;
         this._api = new Api();
-        this.usedAdresses = new Array();
     }
 
     getBlance(): number {
@@ -196,32 +199,45 @@ export class BTCWallet {
         return parent.derive(path).privateKey;
     }
 
-    address2Index(address: string): number {
-        for(let i = 0; i < this.usedAdresses.length; i++) {
-            if(this.usedAdresses[i] === address) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    signRawTransaction(input: UTXO, output: Output, index: number): string {
-        let utxo = UnspentOutput.fromObject(input);
-        let tx = Transaction().fee(800000)
-            .from(utxo)
-            .to(output.toAddr, output.amount)
-            .change(output.chgAddr)
-            .sign(this._privateKeyOf(index));
-
-        return tx.toString("hex");
-    }
-
-    async spend(output: Output): Promise<string> {
+    /**
+     * Spend btc from all available utxos, using index 0 address as the default
+     * change address.
+     * 
+     * Our spend policies are:
+     * 
+     * 1. utxo must at least `MIN_CONFIRMATIONS`
+     * 2. greedy algorithm to choose the sufficient balances
+     * 
+     * TODO: design a smarter stratagy (http://bitcoinfees.com/)
+     *
+     * @param {Output} output Specify `toAddr`, `amount` and `chgaddr`
+     * @returns {Promise<string>} Transaction hash of this transaction
+     * @memberof BTCWallet
+     */
+    async spend(output: Output, priority: PRIORITY): Promise<string> {
         if(output.amount >= this.balance) {
             throw new Error("Insufficient balance!");
         }
 
-        let utxos = await this.getUnspentOutputs(6);
+        // TODO: check error
+        let fee = await this._api.feePerByte()
+        switch(priority) {
+            case "high":
+                fee = fee.fastestFee;
+                break;
+            case "medium":
+                fee = fee.halfHourFee;
+                break;
+            case "low":
+                fee = fee.hourFee;
+                break;
+        }
+
+        if(fee < BTCWallet.SAFELOW_FEE || fee > BTCWallet.HIGHEST_FEE) {
+            throw new Error("Abnormal fee rate");
+        }
+
+        let utxos = await this.getUnspentOutputs(BTCWallet.MIN_CONFIRMATIONS);
         utxos.sort((a, b) => a.amount - b.amount);
 
         let collected = [];
@@ -236,27 +252,31 @@ export class BTCWallet {
 
         let keySet = [];
         for(let i = 0; i < collected.length; i++) {
-            keySet.push(this._privateKeyOf(this.address2Index(collected[i].address)));
+            keySet.push(this._privateKeyOf(this.usedAdresses[collected[i].address]));
         }
 
         console.log("collected: ", collected)
         console.log("accumlated: ", accumlated)
-        console.log("keyset: ", keySet)
+        console.log("keyset length: ", keySet.length)
 
         output.amount = Unit.fromBTC(output.amount).toSatoshis();
-        let rawTx = new Transaction()
+        let rawTx = new Transaction().feePerKb(fee * 1000)
             .from(collected)
             .to(output.toAddr, output.amount)
-            // .change(output.chgAddr === undefined ? this.derive(0) : output.chgAddr)
-            .change(output.chgAddr)
+            .change(output.chgAddr === undefined ? this.derive(0) : output.chgAddr)
             .sign(keySet)
 
-        let serialized = rawTx.serialize(true);
-        // If it is successed ?
-        let res = await this._api.sendRawTransaction(serialized);
+        console.log("rawTx:", rawTx)
 
-        // little endian
-        return rawTx._getHash().toString('hex');
+        let serialized = rawTx.serialize(true);
+        console.log("serialized:", serialized)
+
+        let res = await this._api.sendRawTransaction(serialized);
+        if(res === undefined || res.hasOwnProperty('error')) {
+            throw new Error(res.error);
+        }
+        console.log("txHash: ",res.tx.hash);
+        return res.tx.hash;
     }
 
     private _p2pkh(address: string): any {
@@ -278,8 +298,10 @@ export class BTCWallet {
         let used = await this.scanUsedAddress();
         for(let i = 0; i < used; i++) {
             let address = this.derive(i);
-            // TODO: requrest error handling
             let addrinfo = await this._api.getAddrInfo(address, true);
+            if(addrinfo === undefined || addrinfo.hasOwnProperty('error')) {
+                throw new Error("Response error!");
+            }
             if(addrinfo.final_balance !==0 && addrinfo.txrefs.length !== 0) {
                 let utxo = addrinfo.txrefs;
                 for(let j = 0; j < utxo.length; j++) {
@@ -292,24 +314,26 @@ export class BTCWallet {
                             "amount": Unit.fromSatoshis(utxo[j].value).BTC,
                             "confirmations": utxo[j].confirmations
                         })
-                    }                    
+                    }
                 }
-            }     
+            }
         }
 
-        return utxos;     
+        return utxos;
     }
 
     async scanUsedAddress(): Promise<number> {
         let count = 0;
         let i     = 0;
         for(i = 0; ; i++) {
-            // TODO: request error handling
             let res = await this._api.getAddrInfo(this.derive(i));
+            if(res === undefined || res.hasOwnProperty('error')) {
+                throw new Error("Response error!");
+            }
             if(res.total_received === 0 && res.total_sent === 0) {
                 count = count + 1;
             } else {
-                this.usedAdresses.push(res.address);
+                this.usedAdresses[res.address] = i;
                 count = 0;
             }
 

@@ -1,5 +1,6 @@
 export class Api {
     static BASE_URL = 'https://api.blockcypher.com';
+    static ESTIMATION_FEE_URL = 'https://bitcoinfees.earn.com/api/v1/fees/recommended';
 
     constructor() {
 
@@ -30,5 +31,26 @@ export class Api {
             Promise.reject(e);
         }
     }
-}
 
+    async getTxInfo(txHash: string): Promise<any> {
+        let path = Api.BASE_URL + `/v1/btc/test3/txs/${txHash}`;
+
+        try {
+            let response = await fetch(path);
+            let data = await response.json();
+            return data;
+        } catch(e) {
+            Promise.reject(e);
+        }
+    }
+
+    async feePerByte(): Promise<any> {
+        try {
+            let response = await fetch(Api.ESTIMATION_FEE_URL);
+            let data = await response.json();
+            return data;
+        } catch(e) {
+            Promise.reject(e);
+        }
+    }
+}
