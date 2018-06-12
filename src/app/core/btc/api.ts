@@ -22,7 +22,7 @@ export class Api {
         this.wss.onopen = (event) => {
             event = event;
             // send "ping" message every 20s
-            setInterval(function(){self.wss.send(JSON.stringify({"event": "ping"}))}, 10000);
+            setInterval(function(){self.wss.send(JSON.stringify({"event": "ping"}))}, 20000);
         }
     }
 
