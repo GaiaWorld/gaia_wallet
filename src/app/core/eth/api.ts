@@ -1,7 +1,6 @@
 /**
  * ETH api
  */
-import { call } from '../../../pi/worker/server';
 import { Web3 } from '../thirdparty/web3.min';
 
 /* tslint:disable:prefer-template */
